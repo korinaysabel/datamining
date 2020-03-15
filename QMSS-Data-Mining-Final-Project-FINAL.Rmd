@@ -1,0 +1,415 @@
+---
+title: "GR5058 Data Mining Final Project"
+author: "Korina Y. Baraceros & Andrej Arpáš"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    theme: spacelab
+editor_options: 
+  chunk_output_type: console
+---
+<style type="text/css">
+.main-container {
+  max-width: 1100px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<style type="text/css">
+body, td {
+   font-size: 14px;
+}
+code.r{
+  font-size: 13px;
+}
+pre {
+  font-size: 13px
+}
+</style>
+
+***
+
+```{r, setup, include = F}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(dbarts)
+options(width = 120)
+```
+
+
+## Introduction
+
+The objective of this project is to apply machine learning models learned in class to predict the stock price of choice to within the smallest dollar figure as measured by the Root Mean Squared Error (RMSE). Some of the methods deployed to our continuous variable of interest, i.e. the stock price, will be OLS, Random Forests, Bayesian Additive Regression Trees, Neural Nets, and Multivariable Adaptive Regression Splines. The dependent variable will be the stock price of a leading American clinical laboratory, Quest Diagnostics. The predictors include its stock price, the stock price of a direct competitor, LabCorp, exchange rates against the U.S. dollar of currencies pertaining to markets with significant foreign operations/presence by the company, historical 20-, 30-, and 60-day historical volatilities (discussed below), and daily total returns of the stock of interest.  At first we did not take into account time as a variable.  For later models time was included as well as time-lagged variables. 
+
+## Data and Variables
+```{r, 1 - load price, message = F, warning = F, max.print = 10}
+# load stocks
+dgx_lh <- read_csv('data/dgx_lh.csv')
+```
+**Price Data**
+
+Price data was downloaded from Yahoo Finance (historical data) for two stocks - the stock of interest, i.e. DGX - Quest Diagnostics Inc., a pharmaceutical laboratory services, testing, and technologies, and thier biggest global direct competitor - a company called LH - LabCorp or Laboratory Corp. of America Holdings, used as a reference stock. Price quotes are obtained as daily (on trading days, i.e. not every day) and recorded as the so-called Adjusted Daily Close, i.e. the close price adjusted to account for other factors such as, for instance, stock splits, new stock offerings etc. Other data also obtained from Yahoo Finance include the traded daily volumes of the stocks. Some other variables derived from this data are historical volatilities and total daily returns. The Total Daily Return (TDR) is simply a measure of the change in price of the stock, i.e. Today's Price/Yesterday's Price - 1. Therefore, the TDR is just a percentage. Somewhat more interesting a metric frequently used in the Math of Finance are historical volatilities. We calculate 20-, 30-, and 60-Day Historical Volatility of the DGX stock. The calculation is a straightforward rolling standard deviation of the daily total returns going back 250 days, multiplied by the square root of the number of trading days in a typical trading year, which for simplification is customarily considered to be 250. Indeed, this is what we use in our model.
+
+
+<br>
+```{r, 2 - load forex, message = F, warning = F, max.print = 10}
+# load forex
+forex <- read_csv('data/forex.csv')
+```
+**Foreign Exchange Rates**
+
+For the purposes of arriving at variables with predictive properties pertaining to the Adjusted Close Price of the DGX stock, the dependent variable in our model, we explore exchange rates between the U.S. Dollar and the currencies of countries where DGX has operations. The reason being that foreign exchange rates are said by the financial industry modellers (RebellionResearch) to have been found highly indicative of the health of certain target economies, which in turn betters their models. We include the exchange rates from both perspectives. That is, we have rates between the American dollar, the Mexican peso, the British pound, the Brazilian real, and the Canadian dollar, in pair-wise combinations, i.e. USD-to-CAD, CAD-to-USD, USD-to-MXN, MXN-to-USD, USD-to-BRL, BRL-to-USD, USD-to-GBP, and GBP-to-USD. The figures, therefore, represent a ratio, and are parsed daily.
+
+https://www.ofx.com/en-us/forex-news/historical-exchange-rates/
+
+<br>
+```{r, 3 - load nyfed nowcast gdp, message = F, warning = F, max.print = 10}
+# load gdp
+gdp <- read_csv('data/nyfed_nowcast_gdp.csv')
+gdp
+```
+**NY Federal Reserve Nowcast of GDP Growth**
+
+The report tracks the evolution of the New York Fed Staff Nowcast of GDP growth and the impact of new data releases on the forecast. The Nowcasting Report is an innovating tool for arriving at weekly GDP figures. The data is therefore weekly GDP estimates, as percent w-o-w change.
+
+<br>
+Combine all data into a single data frame. 
+```{r, 2 - combine data, message = F, warning = F, max.print = 10}
+data <- gdp %>%
+  left_join(forex) %>%
+  left_join(dgx_lh) %>%
+  drop_na(dgx_adj_close)
+
+data
+```
+<br>
+
+## Predicting 
+
+#### Model 1 - Linear Regression
+
+```{r, 3, message = F, warning = F, cache = T}
+d <- select(data, -"date", -"quarter") # Disregard the time.
+
+lm1 <- lm(dgx_adj_close ~ ., data = d)
+#summary(lm1)
+lm1_rmse <- sigma(lm1); lm1_rmse # RMSE 2.963882.
+```
+
+Tried using just variables that appear 'statistically significant' in the traditional sense of coefficient interpretation.  As discussed in class, *significant* variables for prediction have a different meaning than significant variables for interpretation as in social science. 
+```{r, 4, message = F, warning = F, cache = T}
+lm2 <- lm(dgx_adj_close ~ gdp + us_mxp + lh_adj_close + dgx_volume + dgx_hv60, data = d)
+#summary(lm2)
+lm2_rmse <- sigma(lm2); lm2_rmse # RMSE 3.232503.
+```
+
+#### Model 2 - Random Forests
+
+```{r, 5, message = F, warning = F, cache = T}
+#library(randomForest)
+#library(caret)
+
+set.seed(12202019) # Today's date.
+d <- d[,c(1:7, 9:15, 8)] # Reordering the columns will make them easier to work with.
+in_train <- createDataPartition(d$dgx_adj_close, p = 0.8, list = FALSE)
+training <- d[ in_train, ]
+testing <- d[-in_train, ]
+```
+
+Let's figure out the best tuning parameters:
+
+```{r, 6, message = F, warning = F, cache = T}
+#X <- training %>% select(-dgx_adj_close) %>% drop_na()
+X <- as.matrix(drop_na(training[, 1:14]))
+Y <- as.matrix(training[-c(17,33,82), 15])
+
+#class(X)
+#class(Y)
+```
+
+```{r, 7, message = F, warning = F, cache = T}
+tune_mtry <- tuneRF(X, Y, stepFactor = 1.5, improve = 1e-5, ntree = 1000)
+print(tune_mtry) # Optimal # of mtry = 14.
+```
+
+```{r, 8, message = F, warning = F, cache = T}
+rf_grid <- data.frame(.mtry = 14)
+ctrl <- trainControl(method = "cv", number = 10)
+out <- train(dgx_adj_close ~ ., data = training, method = "rf",
+             trControl = ctrl, tuneGrid = rf_grid, 
+             ntrees = 1000, importance = TRUE, na.action = na.omit)
+varImp(out)
+```
+The most predictive (important) variable here appears to be the adjusted close price of the competitor's stock, then NYFED nowcasted GDP, and the US dollar to Mexican Pesos exchange rate to round out the top 3. 
+
+
+
+```{r, 9, message = F, warning = F, cache = T}
+y_hat <- predict(out, newdata = testing)
+rf_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, 
+                          pred = y_hat)); rf_rmse # RMSE 2.2273334.
+```
+
+
+#### Model 3 - Bayesian Additive Regression Trees
+
+```{r, 10, message = F, warning = F, cache = T}
+n.trees_seq <- seq(from = 50, to = 100, by = 10)
+power_seq <- seq(from = 1, to = 3, by = .4)
+base_seq <- seq(from = .Machine$double.eps, 
+                to = 1 - .Machine$double.eps, by = .2)
+out_bart <- xbart(dgx_adj_close ~ ., data = training, 
+             drop = FALSE, verbose = FALSE, n.reps = 20,
+             n.threads = parallel::detectCores(),
+             n.trees = n.trees_seq, power = power_seq, base = base_seq) # Takes about 5 minutes to run.
+```
+
+```{r, 11, message = F, warning = F, cache = T}
+(best <- as.data.frame(which(out_bart == min(out_bart), arr.ind = TRUE)))
+```
+
+
+```{r, 12, message = F, warning = F, cache = T}
+out_bart2 <- bart2(dgx_adj_close ~ ., data = training, test = testing, 
+             n.trees = n.trees_seq[best$n.trees],
+             base = base_seq[best$base], 
+             power = power_seq[best$power])
+```
+
+```{r, 13, message = F, warning = F, cache = T}
+plot(out_bart2, las = 1)
+```
+
+```{r, 14, message = F, warning = F, cache = T}
+bart2_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close,
+                          pred = rowMeans(out_bart2$yhat.test))); bart2_rmse # RMSE 7.46963356.
+```
+
+
+#### Model 4 - Multivariate Adaptive Regression Splines (MARS)
+
+```{r, 15, message = F, warning = F, cache = T}
+marsGrid <- expand.grid(.degree = 1:3, .nprune = 1:10)
+MARS <- train(dgx_adj_close ~ ., data = training,
+              method = "earth", trControl = ctrl,
+              tuneGrid = marsGrid, na.action = na.omit)
+```
+
+```{r, 16, message = F, warning = F, cache = T}
+coef(MARS$finalModel)
+```
+
+```{r, 17, message = F, warning = F, cache = T}
+varImp(MARS)
+```
+
+```{r, 18, message = F, warning = F, cache = T}
+MARS_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close,
+                          pred = predict(MARS, newdata = testing)[,1])); MARS_rmse
+```
+
+Try again, using only the important variables:
+```{r, 19, message = F, warning = F, cache = T}
+MARS2 <- train(dgx_adj_close ~ lh_adj_close + dgx_hv60 + gdp + us_mxp, data = training,
+              method = "earth", trControl = ctrl,
+              tuneGrid = marsGrid, na.action = na.omit)
+```
+
+```{r, 20, message = F, warning = F, cache = T}
+MARS2_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close,
+                          pred = predict(MARS2, newdata = testing)[,1])); MARS2_rmse
+```
+
+```{r, summary, message = F, warning = F, cache = T}
+model <- c('linear regression', 'random forest', 'BART', 'MARS')
+rmse <- c(lm1_rmse[1], rf_rmse[1], bart2_rmse[1], MARS2_rmse[1])
+
+performance1 <- as_tibble(cbind(model, rmse))
+
+performance1$rmse <- as.numeric(performance1$rmse)
+
+performance1 %>% arrange(rmse)
+```
+
+Better, but not the best. The best result was thus, so far, achieved with RF (RMSE 2.2273334.) This is in U.S. dollars.
+
+
+## Prediciting with Lagged GDP, ForEx, and Adj. Close Prices
+
+Here we re-include time, using the original data frame called `data`, and we lag some of the variables we think may be of interest: `gdp`, `us_uk`, `us_mxp`, `us_bzr`, `dgx_adj_close`, and `lh_adj_close`. 
+It may be that the current price at time t is also dependent on price or gdp or other variable at time t-1, so we'll try lagged data. We'll go from 1 to 2 lags indicating 1 week and 2 weeks prior. 
+
+```{r, 21 add lags, message = F, warning = F}
+data$gdp_tminus1 <- lag(data$gdp, 1)
+data$gdp_tminus2 <- lag(data$gdp, 2)
+
+data$us_uk_tminus1 <- lag(data$us_uk, 1)
+data$us_uk_tminus2<- lag(data$us_uk, 2)
+
+data$us_mxp_tminus1 <- lag(data$us_mxp, 1)
+data$us_mxp_tminus2 <- lag(data$us_mxp, 2)
+
+data$us_bzr_tminus1 <- lag(data$us_bzr, 1)
+data$us_bzr_tminus2 <- lag(data$us_bzr, 2)
+
+data$dgx_adj_close_tminus1 <- lag(data$dgx_adj_close, 1)
+data$dgx_adj_close_tminus2 <- lag(data$dgx_adj_close, 2)
+
+data$lh_adj_close_tminus1 <- lag(data$lh_adj_close, 1)
+data$lh_adj_close_tminus2 <- lag(data$lh_adj_close, 2)
+
+data$quarter <- NULL
+
+data <- data %>% drop_na() # we lose a few obs due to lagged data
+```
+
+
+#### Model 5 - Linear Regression
+```{r, 22 - model 5 linear regression, message = F, warning = F, cache = T}
+# train test split
+set.seed(12202019)
+in_train <- createDataPartition(y = data$dgx_adj_close, p = .65, list = FALSE)
+training <- data[ in_train, ]
+testing  <- data[-in_train, ]
+
+set.seed(12202019)
+ctrl <- trainControl(method = "cv", number = 15)
+lmt1  <- train(dgx_adj_close ~ ., data = training, method = 'lm', 
+               trControl = ctrl, preProcess = c("center", "scale"), na.action = na.omit)
+lmt1_y_hat <- predict(lmt1, newdata = testing, na.action = na.pass)
+
+lmt1_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = lmt1_y_hat)); lmt1_rmse
+```
+
+#### Model 6 - Decision Tree
+```{r, 23 - model 5 decision tree, message = F, warning = F, fig.align='center', fig.height=4}
+set.seed(12202019)
+ctrl <- trainControl(method = "cv", number = 15)
+dt1 <- train(dgx_adj_close ~ ., data = training, method = "rpart2",
+              preProcess = c("center", "scale"), tuneLength = 10, trControl = ctrl, na.action = na.omit)
+
+plot(dt1)
+
+dt1_y_hat <- predict(dt1, newdata = testing, na.action = na.pass)
+
+dt1_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = dt1_y_hat)); dt1_rmse
+```
+
+#### Model 7 - Random Forests
+```{r, 24 - model 6 random forest, message = F, warning = F, cache = T}
+set.seed(12202019)
+ctrl <- trainControl(method = "cv", number = 15)
+rf1_grid <- data.frame(.mtry = 2:(ncol(training) - 1L))
+
+rf1 <- train(dgx_adj_close ~ ., data = training, method = "rf",
+              preProcess = c("center", "scale"), trControl = ctrl, tuneGrid = rf_grid, 
+             ntrees = 1000, importance = T, na.action = na.omit)
+
+#varImp(rf1)
+
+rf1_y_hat <- predict(rf1, newdata = testing, na.action = na.pass)
+
+rf1_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = rf1_y_hat)); rf1_rmse
+```
+
+#### Model 8 - Boosting
+```{r, 25 - model 7 boosting, message = F, warning = F, cache = T}
+set.seed(12202019)
+ctrl <- trainControl(method = "cv", number = 20)
+gbm_grid <- expand.grid(.interaction.depth = seq(1, 6, by = 1),
+                        .n.trees = seq(100, 1000, by = 50),
+                        .shrinkage = c(0.01, 0.1),
+                        .n.minobsinnode = 1:5)
+
+gbm1 <- train(dgx_adj_close ~ ., data = training, method = "gbm",
+              preProcess = c("center", "scale"), trControl = ctrl, tuneGrid = gbm_grid, verbose = F, na.action = na.omit)
+gbm1_y_hat <- predict(gbm1, newdata = testing, na.action = na.pass)
+
+gbm1_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = gbm1_y_hat)); gbm1_rmse
+```
+
+
+#### Model 9 - BART
+```{r, 26 - model 8 BART, message = F, warning = F, cache = T}
+set.seed(12202019)
+
+n.trees_seq <- seq(from = 50, to = 100, by = 10)
+power_seq <- seq(from = 1, to = 3, by = .5)
+base_seq <- seq(from = .Machine$double.eps, 
+                to = 1 - .Machine$double.eps, by = .2)
+
+bart1 <- xbart(dgx_adj_close ~ ., data = training, 
+               drop = F, verbose = F, n.reps = 10,
+               n.threads = parallel::detectCores(),
+               n.trees = n.trees_seq, power = power_seq, base = base_seq)
+
+best <- as.data.frame(which(bart1 == min(bart1), arr.ind = T))
+
+bart1_out <- bart2(dgx_adj_close ~ ., data = training, test = testing, 
+                     n.trees = n.trees_seq[best$n.trees],
+                     base = base_seq[best$base], 
+                     power = power_seq[best$power])
+
+bart1_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = rowMeans(bart1_out$yhat.test))); bart1_rmse
+```
+
+
+#### Model 10 - Neural Nets
+```{r, 27 - model 9 neural nets, message = F, warning = F, cache = T}
+set.seed(12202019)
+nnetGrid <- expand.grid(.decay = c(0, 0.001, 0.01, .1), .size = c(1:20))
+ctrl <- trainControl(method = "cv", number = 20)
+
+nn <- train(dgx_adj_close ~ ., data = training, method = "nnet",
+            trControl = ctrl, tuneGrid = nnetGrid,
+            preProcess = c("center", "scale"), trace = FALSE, na.action = na.omit)
+nn_out <- predict(nn, newdata = testing, na.action = na.pass)
+
+nn_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = nn_out)); nn_rmse
+```
+
+#### Model 11 - MARS
+```{r, 28 - model 10 MARS, message = F, warning = F, cache = T}
+set.seed(12202019)
+ctrl <- trainControl("cv", number = 15)
+marsGrid <- expand.grid(.degree = 1:3, .nprune = 1:10)
+
+mars <- train(dgx_adj_close ~ ., data = testing, method = "earth", 
+              preProcess = c("center", "scale"), trControl = ctrl, tuneGrid = marsGrid)
+mars_out <- predict(mars, newdata = testing)
+
+mars_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = mars_out[ , 1])); mars_rmse
+```
+
+#### Model 12 - Logistic Regression
+```{r, 29 - logistic regression, warning = F, message = F, cache = T}
+set.seed(12202019)
+ctrl <- trainControl("cv", number = 15)
+tune_grid <- expand.grid(.alpha = seq(0, 1, length.out = 10),
+                         .lambda = seq(0, 1, length.out = 10))
+
+enet <- train(dgx_adj_close ~ ., data = training, method = "glmnet", 
+              preProcess = c("center", "scale"), trControl = ctrl, tuneGrid = tune_grid)
+enet_out <- predict(enet, newdata = testing)
+
+enet_rmse <- defaultSummary(data.frame(obs = testing$dgx_adj_close, pred = enet_out)); enet_rmse
+```
+
+
+## Observations and Discussion
+```{r, 30 - comparing rmse}
+model_t <- c('linear regression', 'decision tree', 'random forest', 'boosting' , 'BART', 'NN', 'MARS', 'penalized logit')
+rmse_t <- c(lmt1_rmse[1], dt1_rmse[1], rf1_rmse[1], gbm1_rmse[1], bart1_rmse[1], nn_rmse[1], mars_rmse[1], enet_rmse[1])
+
+performance2 <- as_tibble(cbind(model_t, rmse_t))
+
+performance2$rmse_t <- as.numeric(performance2$rmse_t)
+
+performance2 %>% arrange(rmse_t)
+```
+
+
+Running the various different models yielded the lowest RMSE (~\$2.23) with Random Forests in the models that did not take account of the time factor. Once time and lagged data was added, linear regression kept the lead as the best model until we tried MARS. The RMSE for MARS is within \$1, using these settings and sampling seed for test/train/split.  Since some models are sensitive to (random) starting points (such as random forest), we need to keep this in mind when interpreting the RMSE even though cross-validation was done.  The surprise here was the neural net.  Perhaps the tuning parameters could be tweaked a bit more to get better predictions, but its RMSE is really out the door compared to the other models.  Overall, adding time and some lagged data improved the models, though just in terms of a few tens of cents here and there.
